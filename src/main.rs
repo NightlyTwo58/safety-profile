@@ -15,7 +15,7 @@ fn main() {
     let path = PathBuf::from(&args[1]);
     let src = fs::read_to_string(&path).expect("Failed to read input file");
 
-    //  Stage 1: Parse 
+    //  Parse 
     let t = Instant::now();
     let (ast, _) = parse_sv_str(
         &src,
@@ -28,7 +28,7 @@ fn main() {
         .expect("Failed to parse Verilog");
     println!("[parse]    {:>10.3?}", t.elapsed());
 
-    //  Stage 2: Compile to Netlist(s) 
+    //  Compile to Netlist(s) 
     // from_vast returns a Vec — one Netlist per module in the file.
     // For benchmarking we take the first (top) module.
     let t = Instant::now();
@@ -36,7 +36,7 @@ fn main() {
     let netlist = netlists.into_iter().next().expect("No modules found in file");
     println!("[compile]  {:>10.3?}", t.elapsed());
 
-    //  Stage 3: Clean 
+    //  Clean 
     let t = Instant::now();
     let msg = Clean(PhantomData::<Cell>)
         .run(&netlist)
@@ -48,14 +48,14 @@ fn main() {
     let msg = FoldAllPatterns.run(&netlist).expect("Fold failed");
     println!("[fold]     {:>10.3?}  {}", t.elapsed(), msg);
 
-    //  Stage 5: Clean again 
+    //  Clean again 
     let t = Instant::now();
     let msg = Clean(PhantomData::<Cell>)
         .run(&netlist)
         .expect("Clean 2 failed");
     println!("[clean2]   {:>10.3?}  {}", t.elapsed(), msg);
 
-    //  Stage 6: Emit 
+    //  Emit 
     let t = Instant::now();
     let verilog = PrintVerilog(PhantomData::<Cell>)
         .run(&netlist)

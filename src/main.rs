@@ -1,17 +1,16 @@
-use nl_compiler::from_vast;
-use safety_pass::passes::{Clean, FoldAllPatterns, PrintVerilog};
-use safety_pass::{Cell, Pass};
-use std::marker::PhantomData;
-use std::{collections::HashMap, env, fs, path::PathBuf, time::Instant};
-use sv_parser::parse_sv_str;
+use safety_profiler::run_pipeline;
+use std::{env, fs, path::PathBuf};
 
-macro_rules! stage {
-    ($label:expr, $elapsed:expr) => {
-        println!("[{}]  {}µs", $label, $elapsed.as_micros());
-    };
-    ($label:expr, $elapsed:expr, $msg:expr) => {
-        println!("[{}]  {}µs  {}", $label, $elapsed.as_micros(), $msg);
-    };
+/// Print a timing line to stdout in a format compare can parse directly
+/// (it never needs to — compare calls the lib — but this keeps the binary
+/// usable standalone for quick eyeball checks).
+///
+/// Format: `[label]  <µs>µs  <optional note>`
+fn print_stage(stage: &safety_profiler::StageTiming) {
+    match &stage.note {
+        Some(note) => println!("[{}]  {}µs  {}", stage.name, stage.micros(), note),
+        None       => println!("[{}]  {}µs",     stage.name, stage.micros()),
+    }
 }
 
 fn main() {
@@ -22,56 +21,16 @@ fn main() {
     }
 
     let path = PathBuf::from(&args[1]);
+    // File I/O is outside all timers — we measure pass performance, not disk.
     let src = fs::read_to_string(&path).expect("Failed to read input file");
 
-    //  Parse 
-    let t = Instant::now();
-    let (ast, _) = parse_sv_str(
-        &src,
-        path.clone(),
-        &HashMap::new(),
-        &[] as &[PathBuf],
-        true,
-        false,
-    )
-    .expect("Failed to parse Verilog");
-    stage!("parse", t.elapsed());
+    let result = run_pipeline(&src, &path).expect("Pipeline failed");
 
-    //  Stage 2: Compile AST to Netlist)
-    // from_vast returns one Netlist per module; we take the first (top) module.
-    let t = Instant::now();
-    let netlists = from_vast::<Cell>(&ast).expect("Failed to compile to netlist");
-    let netlist = netlists.into_iter().next().expect("No modules found in file");
-    stage!("compile", t.elapsed());
+    for stage in &result.stages {
+        print_stage(stage);
+    }
 
-    //  Clean 1
-    let t = Instant::now();
-    let msg = Clean(PhantomData::<Cell>)
-        .run(&netlist)
-        .expect("Clean pass 1 failed");
-    stage!("clean1", t.elapsed(), msg);
-
-    //  Fold all patterns 
-    let t = Instant::now();
-    let msg = FoldAllPatterns.run(&netlist).expect("Fold failed");
-    stage!("fold", t.elapsed(), msg);
-
-    //  Clean 2 
-    let t = Instant::now();
-    let msg = Clean(PhantomData::<Cell>)
-        .run(&netlist)
-        .expect("Clean pass 2 failed");
-    stage!("clean2", t.elapsed(), msg);
-
-    //  Emit 
-    let t = Instant::now();
-    let verilog = PrintVerilog(PhantomData::<Cell>)
-        .run(&netlist)
-        .expect("Emit failed");
-    stage!("emit", t.elapsed());
-
-    // Write output file
     let out_path = path.with_extension("out.v");
-    fs::write(&out_path, verilog).expect("Failed to write output");
+    fs::write(&out_path, &result.verilog).expect("Failed to write output");
     eprintln!("Written to {}", out_path.display());
 }

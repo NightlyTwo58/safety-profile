@@ -5,6 +5,15 @@ use std::marker::PhantomData;
 use std::{collections::HashMap, env, fs, path::PathBuf, time::Instant};
 use sv_parser::parse_sv_str;
 
+macro_rules! stage {
+    ($label:expr, $elapsed:expr) => {
+        println!("[{}]  {}µs", $label, $elapsed.as_micros());
+    };
+    ($label:expr, $elapsed:expr, $msg:expr) => {
+        println!("[{}]  {}µs  {}", $label, $elapsed.as_micros(), $msg);
+    };
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -25,45 +34,44 @@ fn main() {
         true,
         false,
     )
-        .expect("Failed to parse Verilog");
-    println!("[parse]    {:>10.3?}", t.elapsed());
+    .expect("Failed to parse Verilog");
+    stage!("parse", t.elapsed());
 
-    //  Compile to Netlist(s) 
-    // from_vast returns a Vec — one Netlist per module in the file.
-    // For benchmarking we take the first (top) module.
+    //  Stage 2: Compile AST to Netlist)
+    // from_vast returns one Netlist per module; we take the first (top) module.
     let t = Instant::now();
     let netlists = from_vast::<Cell>(&ast).expect("Failed to compile to netlist");
     let netlist = netlists.into_iter().next().expect("No modules found in file");
-    println!("[compile]  {:>10.3?}", t.elapsed());
+    stage!("compile", t.elapsed());
 
-    //  Clean 
+    //  Clean 1
     let t = Instant::now();
     let msg = Clean(PhantomData::<Cell>)
         .run(&netlist)
-        .expect("Clean failed");
-    println!("[clean]    {:>10.3?}  {}", t.elapsed(), msg);
+        .expect("Clean pass 1 failed");
+    stage!("clean1", t.elapsed(), msg);
 
-    //  Stage 4: Fold all patterns 
+    //  Fold all patterns 
     let t = Instant::now();
     let msg = FoldAllPatterns.run(&netlist).expect("Fold failed");
-    println!("[fold]     {:>10.3?}  {}", t.elapsed(), msg);
+    stage!("fold", t.elapsed(), msg);
 
-    //  Clean again 
+    //  Clean 2 
     let t = Instant::now();
     let msg = Clean(PhantomData::<Cell>)
         .run(&netlist)
-        .expect("Clean 2 failed");
-    println!("[clean2]   {:>10.3?}  {}", t.elapsed(), msg);
+        .expect("Clean pass 2 failed");
+    stage!("clean2", t.elapsed(), msg);
 
     //  Emit 
     let t = Instant::now();
     let verilog = PrintVerilog(PhantomData::<Cell>)
         .run(&netlist)
         .expect("Emit failed");
-    println!("[emit]     {:>10.3?}", t.elapsed());
+    stage!("emit", t.elapsed());
 
-    // Write output next to input
+    // Write output file
     let out_path = path.with_extension("out.v");
     fs::write(&out_path, verilog).expect("Failed to write output");
-    println!("Written to {}", out_path.display());
+    eprintln!("Written to {}", out_path.display());
 }

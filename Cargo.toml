@@ -8,14 +8,17 @@ safety-net = "0.14.0"
 safety-pass = { version = "0.4.17", features = ["id"] }
 nl-compiler = "0.3.2"
 sv-parser = "0.13.4"
-pprof = "0.15.0"
+pprof = { version = "0.15.0", features = ["flamegraph", "criterion"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 
 [[bench]]
-name = ["passes","pipeline"]
+name = "passes"
+harness = false
+
+[[bench]]
+name = "pipeline"
 harness = false
 
 [profile.release]

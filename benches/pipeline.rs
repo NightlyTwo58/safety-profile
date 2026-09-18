@@ -20,19 +20,19 @@ use std::path::PathBuf;
 #[cfg(feature = "flamegraph")]
 use pprof::criterion::{Output, PProfProfiler};
 
-// ── Corpus ───────────────────────────────────────────────────────────────────
+//  Corpus 
 //
 // Add entries as you expand the ISCAS-85 corpus.
 // Files are embedded at compile time so the bench binary is self-contained.
 
 const INPUTS: &[(&str, &str)] = &[
-    ("c17", include_str!("../inputs/c17.v")),
-    // ("c432",  include_str!("../inputs/c432.v")),
+    // ("c17", include_str!("../inputs/c17.v")),
+    ("c432",  include_str!("../inputs/c432.v")),
     // ("c880",  include_str!("../inputs/c880.v")),
     // ("c7552", include_str!("../inputs/c7552.v")),
 ];
 
-// ── Benchmark groups ─────────────────────────────────────────────────────────
+//  Benchmark groups 
 
 fn bench_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse");
@@ -147,7 +147,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-// ── criterion_group wiring ────────────────────────────────────────────────────
+//  criterion_group wiring 
 
 #[cfg(feature = "flamegraph")]
 criterion_group! {

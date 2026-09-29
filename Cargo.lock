@@ -1353,6 +1353,7 @@ dependencies = [
 name = "safety-profiler"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "criterion",
  "eqmap",
  "nl-compiler",

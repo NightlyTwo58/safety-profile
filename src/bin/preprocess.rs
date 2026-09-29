@@ -1,28 +1,49 @@
 /// ISCAS-85 Verilog preprocessor.
 ///
 /// Usage:
-///   cargo run --bin preprocess --release -- [raw_dir] [out_dir]
-///   cargo run --bin preprocess --release           # defaults: inputs/raw → inputs/
-
+///   cargo run --bin preprocess --release -- [RAW_DIR] [OUT_DIR] [--techmap FILE]
+///   cargo run --bin preprocess --release      # defaults: inputs/raw -> inputs/
+use clap::Parser;
 use eqmap::analysis::LutAnalysis;
-use eqmap::driver::{SynthRequest, SynthReport};
+use eqmap::driver::{SynthReport, SynthRequest};
 use eqmap::lut::LutLang;
 use eqmap::rewrite::lutpacking_rules;
-use eqmap::verilog::{SVModule, sv_parse_wrapper};
+use eqmap::verilog::{sv_parse_wrapper, SVModule};
+use safety_profiler::io::collect_inputs;
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+};
+
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Directory with unmodified ISCAS-85 .v files.
+    #[arg(default_value = "inputs/raw")]
+    raw_dir: PathBuf,
+
+    /// Where normalized + synthesized files are written.
+    #[arg(default_value = "inputs")]
+    out_dir: PathBuf,
+
+    /// Techmap file (default: <OUT_DIR>/techmap.v).
+    #[arg(long)]
+    techmap: Option<PathBuf>,
+
+    /// LUT size for eqmap.
+    #[arg(short, long, default_value_t = 6)]
+    k: usize,
+}
 
 /// Run yosys to normalize ISCAS-85 primitives into named CellType instances.
-fn run_yosys(
-    input: &std::path::Path,
-    output: &std::path::Path,
-    techmap: &std::path::Path,
-) -> Result<(), String> {
+fn run_yosys(input: &Path, output: &Path, techmap: &Path) -> Result<(), String> {
     let script = format!(
-        "read_verilog {input}; proc; techmap -map {techmap}; clean -purge; write_verilog -noattr {output}",
-        input = input.display(),
-        output = output.display(),
-        techmap = techmap.display(),
+        "read_verilog {}; proc; techmap -map {}; clean -purge; write_verilog -noattr {}",
+        input.display(),
+        techmap.display(),
+        output.display(),
     );
 
     let result = Command::new("yosys")
@@ -32,15 +53,14 @@ fn run_yosys(
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("yosys exited with {}\n{}", result.status, stderr));
+        return Err(format!("yosys exited with {}\n{stderr}", result.status));
     }
-
     Ok(())
 }
 
 /// Parse the normalized Verilog, run eqmap's synthesis pipeline, and write
 /// the resulting Verilog back out.
-fn run_eqmap(normalized: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+fn run_eqmap(normalized: &Path, output: &Path, k: usize) -> Result<(), String> {
     let src = fs::read_to_string(normalized).map_err(|e| format!("failed to read file: {e}"))?;
 
     let ast = sv_parse_wrapper(&src, Some(normalized.to_path_buf()))
@@ -55,7 +75,7 @@ fn run_eqmap(normalized: &std::path::Path, output: &std::path::Path) -> Result<(
 
     let mut req: SynthRequest<LutLang, LutAnalysis> = SynthRequest::default()
         .with_expr(expr)
-        .with_k(6) // matches eqmap_fpga's `-k` default
+        .with_k(k)
         .with_rules(lutpacking_rules())
         .without_progress_bar();
 
@@ -65,88 +85,73 @@ fn run_eqmap(normalized: &std::path::Path, output: &std::path::Path) -> Result<(
 
     let out_module = SVModule::from_luts(result.get_expr().clone(), mod_name, vec![])?;
 
-    fs::write(output, out_module.to_string())
-        .map_err(|e| format!("failed to write output: {e}"))?;
-
-    Ok(())
+    fs::write(output, out_module.to_string()).map_err(|e| format!("failed to write output: {e}"))
 }
 
-fn process_one(
-    input: &std::path::Path,
-    output: &std::path::Path,
-    techmap: &std::path::Path,
-) -> Result<(), String> {
+fn process_one(input: &Path, output: &Path, techmap: &Path, k: usize) -> Result<(), String> {
     // Normalize into a temp file next to the final output, then run eqmap
-    // over the normalized version and overwrite output with eqmap's result.
+    // over it and overwrite output with eqmap's result.  The temp file is
+    // removed on both success and failure.
     let normalized = output.with_extension("normalized.v");
-    run_yosys(input, &normalized, techmap)?;
-    let result = run_eqmap(&normalized, output);
+    let result = run_yosys(input, &normalized, techmap).and_then(|()| run_eqmap(&normalized, output, k));
     let _ = fs::remove_file(&normalized);
     result
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let raw_dir = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("inputs/raw"));
-    let out_dir = PathBuf::from(args.get(2).map(String::as_str).unwrap_or("inputs"));
-    // techmap.v lives next to the output files so it's easy to find and edit.
-    let techmap = out_dir.join("techmap.v");
+fn run(cli: Cli) -> Result<usize, String> {
+    let techmap = cli.techmap.clone().unwrap_or_else(|| cli.out_dir.join("techmap.v"));
 
-    if !raw_dir.exists() {
-        eprintln!(
-            "ERROR: '{}' not found.\nPlace unmodified ISCAS-85 .v files there and re-run.",
-            raw_dir.display()
-        );
-        std::process::exit(1);
+    if !cli.raw_dir.exists() {
+        return Err(format!(
+            "'{}' not found.\nPlace unmodified ISCAS-85 .v files there and re-run.",
+            cli.raw_dir.display()
+        ));
     }
-
     if !techmap.exists() {
-        eprintln!(
-            "ERROR: '{}' not found.\nCopy inputs/techmap.v into the output directory.",
+        return Err(format!(
+            "'{}' not found.\nCopy inputs/techmap.v there or pass --techmap.",
             techmap.display()
-        );
-        std::process::exit(1);
+        ));
     }
-
-    fs::create_dir_all(&out_dir).expect("Failed to create output directory");
+    fs::create_dir_all(&cli.out_dir).map_err(|e| format!("cannot create output directory: {e}"))?;
 
     println!("=== Preprocessing ISCAS-85 inputs (yosys/techmap.v + eqmap synth) ===");
-    println!("  raw:     {}", raw_dir.display());
-    println!("  output:  {}", out_dir.display());
+    println!("  raw:     {}", cli.raw_dir.display());
+    println!("  output:  {}", cli.out_dir.display());
     println!("  techmap: {}\n", techmap.display());
 
-    let mut inputs: Vec<PathBuf> = fs::read_dir(&raw_dir)
-        .expect("Failed to read raw dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map_or(false, |e| e == "v"))
-        .collect();
-    inputs.sort();
-
-    if inputs.is_empty() {
-        eprintln!("No .v files found in {}/", raw_dir.display());
-        std::process::exit(1);
-    }
-
+    let inputs = collect_inputs(std::slice::from_ref(&cli.raw_dir), None)?;
     let mut failures = 0usize;
 
     for input in &inputs {
-        let name = input.file_name().unwrap().to_string_lossy();
-        let output = out_dir.join(input.file_name().unwrap());
+        let file = input.file_name().unwrap();
+        let name = file.to_string_lossy();
+        let output = cli.out_dir.join(file);
 
-        match process_one(input, &output, &techmap) {
-            Ok(()) => println!("  {name}: OK → {}", output.display()),
+        match process_one(input, &output, &techmap, cli.k) {
+            Ok(()) => println!("  {name}: OK -> {}", output.display()),
             Err(e) => {
                 eprintln!("  {name}: FAILED\n    {e}");
                 failures += 1;
             }
         }
     }
+    Ok(failures)
+}
 
-    println!();
-    if failures == 0 {
-        println!("Done. Run:  cargo run --bin compare --release");
-    } else {
-        eprintln!("{failures} file(s) failed.");
-        std::process::exit(1);
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(0) => {
+            println!("\nDone. Run:  cargo run --bin compare --release");
+            ExitCode::SUCCESS
+        }
+        Ok(n) => {
+            eprintln!("\n{n} file(s) failed.");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

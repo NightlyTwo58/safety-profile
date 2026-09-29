@@ -11,6 +11,7 @@ sv-parser = "0.13.4"
 eqmap = { git = "https://github.com/cornell-zhang/eqmap" }
 pprof = { version = "0.15.0", features = ["flamegraph", "criterion"], optional = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+clap = { version = "4", features = ["derive"] }
 
 [[bench]]
 name = "pipeline"

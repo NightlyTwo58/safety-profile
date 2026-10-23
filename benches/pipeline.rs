@@ -15,9 +15,10 @@
 /// With per-bench flamegraphs (needs `debug = 1` in [profile.release]):
 ///     cargo bench --features flamegraph
 ///     # SVGs: target/criterion/<group>/<circuit>/profile/flamegraph.svg
-
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use safety_profiler::{stage_clean, stage_compile, stage_emit, stage_fold, stage_parse};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use safety_profiler::{
+    stage_clean, stage_compile, stage_emit, stage_fold, stage_parse, stage_rename_nets,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -92,6 +93,24 @@ fn bench_compile(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
             b.iter(|| stage_compile(ast).expect("compile failed"))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_rename_nets(c: &mut Criterion) {
+    let inputs = load_inputs();
+    let mut group = c.benchmark_group("rename_nets");
+
+    for (name, src, path) in &inputs {
+        let ast = stage_parse(src, path).expect("parse failed");
+        group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
+            b.iter_batched(
+                || stage_compile(ast).expect("compile failed"),
+                |nl| stage_rename_nets(&nl).expect("rename nets failed"),
+                BatchSize::SmallInput,
+            )
         });
     }
 
@@ -195,9 +214,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
     for (name, src, path) in &inputs {
         group.bench_with_input(BenchmarkId::from_parameter(name), src, |b, src| {
-            b.iter(|| {
-                safety_profiler::run_pipeline(src, path).expect("pipeline failed")
-            })
+            b.iter(|| safety_profiler::run_pipeline(src, path).expect("pipeline failed"))
         });
     }
 
@@ -215,6 +232,7 @@ criterion_group! {
     targets =
         bench_parse,
         bench_compile,
+        bench_rename_nets,
         bench_clean1,
         bench_fold,
         bench_clean2,
@@ -227,6 +245,7 @@ criterion_group!(
     pipeline_benches,
     bench_parse,
     bench_compile,
+    bench_rename_nets,
     bench_clean1,
     bench_fold,
     bench_clean2,

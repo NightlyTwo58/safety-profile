@@ -1,12 +1,13 @@
 /// Input discovery and output layout shared by every binary.
 ///
-/// Output layout (root defaults to `output/`, never under `target/`):
+/// Application output layout (root defaults to `output/`; directories are
+/// created only when a command writes that kind of artifact):
 ///
 /// ```text
 /// output/
-///   stats/        CSV files
-///   flamegraphs/  one SVG per circuit
-///   verilog/ours/ and verilog/yosys/
+///   stats/        compare CSV files
+///   flamegraphs/  <circuit>.pipeline.svg (when requested)
+///   verilog/ours/ and verilog/yosys/ (compare or --save-verilog)
 /// ```
 use std::{
     fs, io,
@@ -33,7 +34,10 @@ pub fn collect_inputs(paths: &[PathBuf], filter: Option<&str>) -> Result<Vec<Pat
     for p in paths {
         if p.is_dir() {
             let rd = fs::read_dir(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            out.extend(rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| is_input(p)));
+            out.extend(
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| is_input(p)),
+            );
         } else if p.is_file() {
             out.push(p.clone());
         } else {
@@ -41,7 +45,10 @@ pub fn collect_inputs(paths: &[PathBuf], filter: Option<&str>) -> Result<Vec<Pat
         }
     }
     if let Some(f) = filter {
-        out.retain(|p| p.file_stem().is_some_and(|s| s.to_string_lossy().contains(f)));
+        out.retain(|p| {
+            p.file_stem()
+                .is_some_and(|s| s.to_string_lossy().contains(f))
+        });
     }
     out.sort();
     out.dedup();
@@ -49,6 +56,18 @@ pub fn collect_inputs(paths: &[PathBuf], filter: Option<&str>) -> Result<Vec<Pat
         return Err("no matching .v files found".into());
     }
     Ok(out)
+}
+
+/// Remove inputs whose file stem contains any of the supplied substrings.
+pub fn exclude_inputs(inputs: &mut Vec<PathBuf>, excludes: &[String]) -> usize {
+    let before = inputs.len();
+    inputs.retain(|path| {
+        !path.file_stem().is_some_and(|stem| {
+            let stem = stem.to_string_lossy();
+            excludes.iter().any(|exclude| stem.contains(exclude))
+        })
+    });
+    before - inputs.len()
 }
 
 /// Root of all generated artifacts.  Subdirectories are created on demand.
@@ -71,6 +90,10 @@ impl OutDir {
 
     pub fn flamegraphs(&self) -> io::Result<PathBuf> {
         self.sub(&["flamegraphs"])
+    }
+
+    pub fn pipeline_flamegraph(&self, stem: &str) -> io::Result<PathBuf> {
+        Ok(self.flamegraphs()?.join(format!("{stem}.pipeline.svg")))
     }
 
     /// `tool` is `"ours"` or `"yosys"`.

@@ -23,7 +23,7 @@ pub mod io;
 pub mod stats;
 
 use nl_compiler::from_vast;
-use safety_pass::passes::{Clean, FoldAllPatterns, PrintVerilog};
+use safety_pass::passes::{Clean, FoldAllPatterns, PrintVerilog, RenameNets};
 use safety_pass::{Cell, Pass};
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -133,6 +133,20 @@ pub fn stage_emit(netlist: &Net) -> Result<String, PipelineError> {
     Ok(PrintVerilog(PhantomData::<Cell>).run(netlist)?)
 }
 
+/// Apply the sequential net and instance renaming pass.
+#[inline(never)]
+pub fn stage_rename_nets(netlist: &Net) -> Result<String, PipelineError> {
+    Ok(RenameNets(PhantomData::<Cell>).run(netlist)?)
+}
+
+/// Run `RenameNets` on a freshly compiled netlist and return only its timing.
+/// Parsing and compilation are setup, so they are excluded from the measurement.
+pub fn run_rename_nets(src: &str, path: &Path) -> Result<StageTiming, PipelineError> {
+    let ast = stage_parse(src, path)?;
+    let netlist = stage_compile(&ast)?;
+    timed_note("rename_nets", || stage_rename_nets(&netlist))
+}
+
 // Full pipeline
 
 /// Time `f`, record it under `name`, and return its value.
@@ -143,20 +157,26 @@ fn timed<T>(
 ) -> Result<T, PipelineError> {
     let t = Instant::now();
     let out = f()?;
-    stages.push(StageTiming { name, elapsed: t.elapsed(), note: None });
+    stages.push(StageTiming {
+        name,
+        elapsed: t.elapsed(),
+        note: None,
+    });
     Ok(out)
 }
 
 /// Like `timed`, for passes whose returned `String` is a diagnostic note.
 fn timed_note(
-    stages: &mut Vec<StageTiming>,
     name: &'static str,
     f: impl FnOnce() -> Result<String, PipelineError>,
-) -> Result<(), PipelineError> {
+) -> Result<StageTiming, PipelineError> {
     let t = Instant::now();
     let note = f()?;
-    stages.push(StageTiming { name, elapsed: t.elapsed(), note: Some(note) });
-    Ok(())
+    Ok(StageTiming {
+        name,
+        elapsed: t.elapsed(),
+        note: Some(note),
+    })
 }
 
 /// Run the complete pipeline and return structured timing + output.
@@ -168,9 +188,9 @@ pub fn run_pipeline(src: &str, path: &Path) -> Result<PipelineResult, PipelineEr
 
     let ast = timed(&mut stages, "parse", || stage_parse(src, path))?;
     let netlist = timed(&mut stages, "compile", || stage_compile(&ast))?;
-    timed_note(&mut stages, "clean1", || stage_clean(&netlist))?;
-    timed_note(&mut stages, "fold", || stage_fold(&netlist))?;
-    timed_note(&mut stages, "clean2", || stage_clean(&netlist))?;
+    stages.push(timed_note("clean1", || stage_clean(&netlist))?);
+    stages.push(timed_note("fold", || stage_fold(&netlist))?);
+    stages.push(timed_note("clean2", || stage_clean(&netlist))?);
     let verilog = timed(&mut stages, "emit", || stage_emit(&netlist))?;
 
     Ok(PipelineResult { stages, verilog })

@@ -1,5 +1,7 @@
 use clap::Parser;
-use safety_profiler::{flame, io::OutDir, run_pipeline, stats::Summary, PipelineResult};
+use safety_profiler::{
+    PipelineResult, flame, io::OutDir, run_pipeline, run_rename_nets, stats::Summary,
+};
 use std::{fs, path::PathBuf, process::ExitCode, time::Duration};
 
 /// Run the safety pass pipeline on one Verilog file and print stage timings.
@@ -17,9 +19,13 @@ struct Cli {
     #[arg(short, long, default_value_t = 1)]
     iters: usize,
 
-    /// Also write a flamegraph to <out-dir>/flamegraphs/.
+    /// Also write a grouped pipeline CPU flamegraph under <out-dir>/flamegraphs/.
     #[arg(long)]
     flamegraph: bool,
+
+    /// Save the pipeline's emitted Verilog under <out-dir>/verilog/ours/.
+    #[arg(long)]
+    save_verilog: bool,
 
     /// Wall-clock budget for the flamegraph run, in seconds.
     #[arg(long, default_value_t = 2.0)]
@@ -29,36 +35,49 @@ struct Cli {
 fn run(cli: Cli) -> Result<(), String> {
     let out = OutDir::new(&cli.out_dir);
     // File I/O is outside all timers: we measure pass performance, not disk.
-    let src = fs::read_to_string(&cli.input)
-        .map_err(|e| format!("{}: {e}", cli.input.display()))?;
-    let stem = cli.input.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let src =
+        fs::read_to_string(&cli.input).map_err(|e| format!("{}: {e}", cli.input.display()))?;
+    let stem = cli
+        .input
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
 
     let runs: Vec<PipelineResult> = (0..cli.iters.max(1))
         .map(|_| run_pipeline(&src, &cli.input).map_err(|e| format!("pipeline failed: {e}")))
         .collect::<Result<_, _>>()?;
+    let rename_runs = (0..cli.iters.max(1))
+        .map(|_| run_rename_nets(&src, &cli.input).map_err(|e| format!("rename nets failed: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
     let last = runs.last().expect("at least one run");
 
     for (i, stage) in last.stages.iter().enumerate() {
         let samples: Vec<u128> = runs.iter().map(|r| r.stages[i].micros()).collect();
-        let s = Summary::from_micros(&samples);
-        let note = stage.note.as_deref().unwrap_or("");
-        if runs.len() == 1 {
-            println!("[{}]  {:.0}µs  {note}", stage.name, s.median);
-        } else {
-            println!(
-                "[{}]  median {:.1}µs  min {:.1}  sd {:.1}  {note}",
-                stage.name, s.median, s.min, s.stddev
-            );
-        }
+        print_summary(stage.name, &samples, stage.note.as_deref().unwrap_or(""));
     }
 
-    let v_dir = out.verilog("ours").map_err(|e| e.to_string())?;
-    let v_path = v_dir.join(format!("{stem}.v"));
-    fs::write(&v_path, &last.verilog).map_err(|e| format!("{}: {e}", v_path.display()))?;
-    eprintln!("Written to {}", v_path.display());
+    let rename_samples: Vec<u128> = rename_runs.iter().map(|stage| stage.micros()).collect();
+    print_summary(
+        "rename_nets",
+        &rename_samples,
+        rename_runs
+            .last()
+            .and_then(|stage| stage.note.as_deref())
+            .unwrap_or(""),
+    );
+
+    if cli.save_verilog {
+        let v_path = out
+            .verilog("ours")
+            .map_err(|e| e.to_string())?
+            .join(format!("{stem}.v"));
+        fs::write(&v_path, &last.verilog).map_err(|e| format!("{}: {e}", v_path.display()))?;
+        eprintln!("Verilog written to {}", v_path.display());
+    }
 
     if cli.flamegraph {
-        let svg = out.flamegraphs().map_err(|e| e.to_string())?.join(format!("{stem}.svg"));
+        let svg = out.pipeline_flamegraph(&stem).map_err(|e| e.to_string())?;
         let n = flame::profile_pipeline(
             &src,
             &cli.input,
@@ -68,6 +87,18 @@ fn run(cli: Cli) -> Result<(), String> {
         eprintln!("Flamegraph ({n} iterations): {}", svg.display());
     }
     Ok(())
+}
+
+fn print_summary(name: &str, samples: &[u128], note: &str) {
+    let summary = Summary::from_micros(samples);
+    if samples.len() == 1 {
+        println!("[{name}]  {:.0}µs  {note}", summary.median);
+    } else {
+        println!(
+            "[{name}]  median {:.1}µs  min {:.1}  sd {:.1}  {note}",
+            summary.median, summary.min, summary.stddev
+        );
+    }
 }
 
 fn main() -> ExitCode {

@@ -18,6 +18,7 @@
 
 pub mod flame;
 pub mod io;
+pub mod mem;
 pub mod report;
 pub mod stats;
 pub mod yosys;
@@ -188,4 +189,12 @@ pub fn run_rename_nets(src: &str, path: &Path) -> Result<StageTiming, PipelineEr
     let ast = stage_parse(src, path)?;
     let netlist = stage_compile(&ast)?;
     timed_note("rename_nets", || stage_rename_nets(&netlist))
+}
+
+/// Rename nets and instances on a freshly compiled netlist and emit the Verilog.
+pub fn rename_netlist(src: &str, path: &Path) -> Result<String, PipelineError> {
+    let ast = stage_parse(src, path)?;
+    let netlist = stage_compile(&ast)?;
+    stage_rename_nets(&netlist)?;
+    stage_emit(&netlist)
 }

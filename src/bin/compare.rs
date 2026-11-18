@@ -48,6 +48,14 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     warmup: usize,
 
+    /// Add per-stage columns to the table (CSVs always include them).
+    #[arg(long)]
+    stages: bool,
+
+    /// Print the sequential-rename comparison table (always saved to CSV).
+    #[arg(long)]
+    rename: bool,
+
     /// Print the pipeline CSV to stdout instead of the table.
     #[arg(long)]
     csv: bool,
@@ -184,7 +192,7 @@ fn run(cli: Cli) -> Result<usize, String> {
     } else {
         Some(yosys::startup(cli.iters)?)
     };
-    let mut report = Report::new(startup);
+    let mut report = Report::new(startup, cli.stages);
     if cli.csv {
         print!("{}", report.summary_csv_header());
     } else {
@@ -224,7 +232,7 @@ fn run(cli: Cli) -> Result<usize, String> {
     if report.is_empty() {
         eprintln!("\nNo successful comparisons; no stats files written.");
     } else {
-        if !cli.csv {
+        if cli.rename && !cli.csv {
             print!("{}", report.rename_table());
         }
         let dir = out.stats().map_err(|e| e.to_string())?;

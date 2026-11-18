@@ -1,227 +1,116 @@
-/// Criterion benchmarks for the safety-profiler pipeline.
-///
-/// Per-stage isolation works by using the library's public `stage_*` functions.
-/// Setup work (everything before the stage under test) runs in the `iter_batched`
-/// setup closure, which Criterion does NOT include in the measured time.
-///
-/// Every `.v` file in the `inputs/` directory is automatically included.
-///
-/// Run all benches:
-///     cargo bench
-///
-/// Single group:
-///     cargo bench -- compile
-///
-/// With per-bench flamegraphs (needs `debug = 1` in [profile.release]):
-///     cargo bench --features flamegraph
-///     # SVGs: target/criterion/<group>/<circuit>/profile/flamegraph.svg
+//! Criterion per-stage benchmarks.
+//!
+//! Each stage runs on a fresh netlist prepared by the preceding stages in the
+//! `iter_batched` setup closure, which Criterion excludes from the timing.
+//! Every `.v` file in `inputs/` is benchmarked.
+//!
+//! ```sh
+//! cargo bench                          # all groups
+//! cargo bench -- compile               # one group
+//! cargo bench --features flamegraph    # SVGs in target/criterion/<group>/<circuit>/profile/
+//! ```
+
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use safety_profiler::{
-    stage_clean, stage_compile, stage_emit, stage_fold, stage_parse, stage_rename_nets,
+    Net, io::{collect_inputs, stem}, run_pipeline, stage_clean, stage_compile, stage_emit,
+    stage_fold, stage_parse, stage_rename_nets,
 };
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 #[cfg(feature = "flamegraph")]
 use pprof::criterion::{Output, PProfProfiler};
 
-// Corpus
-//
-// Automatically load every .v file from the project's inputs/ directory.
-// Files are sorted by filename so benchmark ordering is deterministic.
+/// A benchmark circuit: name, source text, and path.
+type Circuit = (String, String, PathBuf);
 
-type Input = (String, String, PathBuf);
-
-fn load_inputs() -> Vec<Input> {
-    let inputs_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("inputs");
-
-    let mut inputs: Vec<Input> = fs::read_dir(&inputs_dir)
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to read inputs directory {}: {e}",
-                inputs_dir.display()
-            )
-        })
-        .filter_map(|entry| {
-            let entry = entry.expect("failed to read directory entry");
-            let path = entry.path();
-
-            if path.extension().and_then(|ext| ext.to_str()) != Some("v") {
-                return None;
-            }
-
-            let name = path.file_stem()?.to_str()?.to_owned();
+/// Load every input circuit under `inputs/`, sorted by path.
+fn load_inputs() -> Vec<Circuit> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("inputs");
+    collect_inputs(&[dir], None)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .into_iter()
+        .map(|path| {
             let src = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-
-            Some((name, src, path))
+            (stem(&path), src, path)
         })
-        .collect();
-
-    inputs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    assert!(
-        !inputs.is_empty(),
-        "no .v files found in {}",
-        inputs_dir.display()
-    );
-
-    inputs
+        .collect()
 }
 
-// Benchmark groups
+fn after_clean(nl: &Net) {
+    stage_clean(nl).expect("clean1 failed");
+}
+
+fn after_fold(nl: &Net) {
+    after_clean(nl);
+    stage_fold(nl).expect("fold failed");
+}
+
+fn after_optimize(nl: &Net) {
+    after_fold(nl);
+    stage_clean(nl).expect("clean2 failed");
+}
+
+/// Benchmark `run` on a netlist that `prep` has already advanced.
+fn bench_stage<R>(c: &mut Criterion, group: &str, prep: fn(&Net), run: fn(&Net) -> R) {
+    let mut group = c.benchmark_group(group);
+    for (name, src, path) in &load_inputs() {
+        let ast = stage_parse(src, path).expect("parse failed");
+        group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
+            b.iter_batched(
+                || {
+                    let nl = stage_compile(ast).expect("compile failed");
+                    prep(&nl);
+                    nl
+                },
+                |nl| run(&nl),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
 
 fn bench_parse(c: &mut Criterion) {
-    let inputs = load_inputs();
     let mut group = c.benchmark_group("parse");
-
-    for (name, src, path) in &inputs {
+    for (name, src, path) in &load_inputs() {
         group.bench_with_input(BenchmarkId::from_parameter(name), src, |b, src| {
             b.iter(|| stage_parse(src, path).expect("parse failed"))
         });
     }
-
     group.finish();
 }
 
 fn bench_compile(c: &mut Criterion) {
-    let inputs = load_inputs();
     let mut group = c.benchmark_group("compile");
-
-    for (name, src, path) in &inputs {
-        let ast = stage_parse(src, path).expect("parse failed"); // setup, not timed
-
+    for (name, src, path) in &load_inputs() {
+        let ast = stage_parse(src, path).expect("parse failed");
         group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
             b.iter(|| stage_compile(ast).expect("compile failed"))
         });
     }
-
     group.finish();
 }
 
-fn bench_rename_nets(c: &mut Criterion) {
-    let inputs = load_inputs();
-    let mut group = c.benchmark_group("rename_nets");
-
-    for (name, src, path) in &inputs {
-        let ast = stage_parse(src, path).expect("parse failed");
-        group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
-            b.iter_batched(
-                || stage_compile(ast).expect("compile failed"),
-                |nl| stage_rename_nets(&nl).expect("rename nets failed"),
-                BatchSize::SmallInput,
-            )
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_clean1(c: &mut Criterion) {
-    let inputs = load_inputs();
-    let mut group = c.benchmark_group("clean1");
-
-    for (name, src, path) in &inputs {
-        let ast = stage_parse(src, path).expect("parse failed");
-
-        group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
-            b.iter_batched(
-                || stage_compile(ast).expect("compile failed"), // setup, not timed
-                |nl| stage_clean(&nl).expect("clean1 failed"),
-                BatchSize::SmallInput,
-            )
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_fold(c: &mut Criterion) {
-    let inputs = load_inputs();
-    let mut group = c.benchmark_group("fold");
-
-    for (name, src, path) in &inputs {
-        let ast = stage_parse(src, path).expect("parse failed");
-
-        group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
-            b.iter_batched(
-                || {
-                    let nl = stage_compile(ast).expect("compile failed");
-                    stage_clean(&nl).expect("clean1 failed");
-                    nl
-                },
-                |nl| stage_fold(&nl).expect("fold failed"),
-                BatchSize::SmallInput,
-            )
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_clean2(c: &mut Criterion) {
-    let inputs = load_inputs();
-    let mut group = c.benchmark_group("clean2");
-
-    for (name, src, path) in &inputs {
-        let ast = stage_parse(src, path).expect("parse failed");
-
-        group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
-            b.iter_batched(
-                || {
-                    let nl = stage_compile(ast).expect("compile failed");
-                    stage_clean(&nl).expect("clean1 failed");
-                    stage_fold(&nl).expect("fold failed");
-                    nl
-                },
-                |nl| stage_clean(&nl).expect("clean2 failed"),
-                BatchSize::SmallInput,
-            )
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_emit(c: &mut Criterion) {
-    let inputs = load_inputs();
-    let mut group = c.benchmark_group("emit");
-
-    for (name, src, path) in &inputs {
-        let ast = stage_parse(src, path).expect("parse failed");
-
-        group.bench_with_input(BenchmarkId::from_parameter(name), &ast, |b, ast| {
-            b.iter_batched(
-                || {
-                    let nl = stage_compile(ast).expect("compile failed");
-                    stage_clean(&nl).expect("clean1 failed");
-                    stage_fold(&nl).expect("fold failed");
-                    stage_clean(&nl).expect("clean2 failed");
-                    nl
-                },
-                |nl| stage_emit(&nl).expect("emit failed"),
-                BatchSize::SmallInput,
-            )
-        });
-    }
-
-    group.finish();
+fn bench_passes(c: &mut Criterion) {
+    bench_stage(c, "clean1", |_| {}, |nl| stage_clean(nl).expect("clean1 failed"));
+    bench_stage(c, "fold", after_clean, |nl| stage_fold(nl).expect("fold failed"));
+    bench_stage(c, "clean2", after_fold, |nl| stage_clean(nl).expect("clean2 failed"));
+    bench_stage(c, "emit", after_optimize, |nl| stage_emit(nl).expect("emit failed"));
+    bench_stage(c, "rename_nets", |_| {}, |nl| {
+        stage_rename_nets(nl).expect("rename nets failed")
+    });
 }
 
 fn bench_full_pipeline(c: &mut Criterion) {
-    let inputs = load_inputs();
     let mut group = c.benchmark_group("full_pipeline");
-
-    for (name, src, path) in &inputs {
+    for (name, src, path) in &load_inputs() {
         group.bench_with_input(BenchmarkId::from_parameter(name), src, |b, src| {
-            b.iter(|| safety_profiler::run_pipeline(src, path).expect("pipeline failed"))
+            b.iter(|| run_pipeline(src, path).expect("pipeline failed"))
         });
     }
-
     group.finish();
 }
-
-// Criterion group wiring
 
 #[cfg(feature = "flamegraph")]
 criterion_group! {
@@ -229,15 +118,7 @@ criterion_group! {
     config = Criterion::default()
         .measurement_time(std::time::Duration::from_secs(10))
         .with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
-    targets =
-        bench_parse,
-        bench_compile,
-        bench_rename_nets,
-        bench_clean1,
-        bench_fold,
-        bench_clean2,
-        bench_emit,
-        bench_full_pipeline
+    targets = bench_parse, bench_compile, bench_passes, bench_full_pipeline
 }
 
 #[cfg(not(feature = "flamegraph"))]
@@ -245,11 +126,7 @@ criterion_group!(
     pipeline_benches,
     bench_parse,
     bench_compile,
-    bench_rename_nets,
-    bench_clean1,
-    bench_fold,
-    bench_clean2,
-    bench_emit,
+    bench_passes,
     bench_full_pipeline
 );
 

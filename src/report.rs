@@ -29,6 +29,8 @@ pub struct Row {
 /// `startup` is `None` when Yosys is disabled, which drops every Yosys column.
 pub struct Report {
     startup: Option<f64>,
+    /// Include per-stage columns in the terminal table (CSVs always have them).
+    stages: bool,
     rows: Vec<Row>,
 }
 
@@ -49,9 +51,10 @@ fn times(v: Option<f64>) -> String {
 }
 
 impl Report {
-    pub fn new(startup: Option<f64>) -> Self {
+    pub fn new(startup: Option<f64>, stages: bool) -> Self {
         Self {
             startup,
+            stages,
             rows: Vec::new(),
         }
     }
@@ -88,8 +91,10 @@ impl Report {
     /// Title, column header, and rule for the pipeline table.
     pub fn table_header(&self) -> String {
         let mut line = format!("{:<18}", "circuit");
-        for s in STAGE_NAMES {
-            let _ = write!(line, " {s:>9}");
+        if self.stages {
+            for s in STAGE_NAMES {
+                let _ = write!(line, " {s:>9}");
+            }
         }
         if self.startup.is_some() {
             let _ = write!(
@@ -106,8 +111,10 @@ impl Report {
 
     pub fn table_row(&self, row: &Row) -> String {
         let mut line = format!("{:<18}", row.name);
-        for s in &row.stages {
-            let _ = write!(line, " {:>9.1}", s.median);
+        if self.stages {
+            for s in &row.stages {
+                let _ = write!(line, " {:>9.1}", s.median);
+            }
         }
         let _ = write!(line, " {:>10.1}", row.ours.median);
         if self.startup.is_some() {

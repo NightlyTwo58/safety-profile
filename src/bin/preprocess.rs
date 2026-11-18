@@ -1,105 +1,84 @@
-/// ISCAS-85 Verilog preprocessor.
-///
-/// Usage:
-///   cargo run --bin preprocess --release -- [RAW_DIR] [OUT_DIR] [--techmap FILE]
-///   cargo run --bin preprocess --release      # defaults: inputs/raw -> inputs/
+//! Normalize raw Verilog into inputs valid for both tools.
+//!
+//! Yosys maps primitives to named cell instances via a techmap, then EqMap
+//! packs the logic into LUTs.
+
 use clap::Parser;
 use eqmap::analysis::LutAnalysis;
 use eqmap::driver::{SynthReport, SynthRequest};
 use eqmap::lut::LutLang;
 use eqmap::rewrite::lutpacking_rules;
 use eqmap::verilog::{sv_parse_wrapper, SVModule};
-use safety_profiler::io::collect_inputs;
-
+use safety_profiler::{io::collect_inputs, yosys};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::ExitCode,
 };
 
+/// Normalize and LUT-pack raw ISCAS-85 Verilog files.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version)]
 struct Cli {
     /// Directory with unmodified ISCAS-85 .v files.
     #[arg(default_value = "inputs/raw")]
     raw_dir: PathBuf,
 
-    /// Where normalized + synthesized files are written.
+    /// Directory for normalized and synthesized files.
     #[arg(default_value = "inputs")]
     out_dir: PathBuf,
 
-    /// Techmap file (default: <OUT_DIR>/techmap.v).
+    /// Techmap file [default: <OUT_DIR>/techmap.v].
     #[arg(long)]
     techmap: Option<PathBuf>,
 
-    /// LUT size for eqmap.
+    /// LUT size for EqMap.
     #[arg(short, long, default_value_t = 6)]
     k: usize,
 }
 
-/// Run yosys to normalize ISCAS-85 primitives into named CellType instances.
-fn run_yosys(input: &Path, output: &Path, techmap: &Path) -> Result<(), String> {
-    let script = format!(
-        "read_verilog {}; proc; techmap -map {}; clean -purge; write_verilog -noattr {}",
-        input.display(),
-        techmap.display(),
-        output.display(),
-    );
-
-    let result = Command::new("yosys")
-        .args(["-q", "-p", &script])
-        .output()
-        .map_err(|e| format!("failed to spawn yosys: {e}"))?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("yosys exited with {}\n{stderr}", result.status));
-    }
-    Ok(())
-}
-
-/// Parse the normalized Verilog, run eqmap's synthesis pipeline, and write
-/// the resulting Verilog back out.
-fn run_eqmap(normalized: &Path, output: &Path, k: usize) -> Result<(), String> {
+/// Parse normalized Verilog, run EqMap LUT packing, and write the result.
+///
+/// Uses `to_single_lut_expr` so multi-output modules (e.g. c17) work.
+fn pack_luts(normalized: &Path, output: &Path, k: usize) -> Result<(), String> {
     let src = fs::read_to_string(normalized).map_err(|e| format!("failed to read file: {e}"))?;
-
     let ast = sv_parse_wrapper(&src, Some(normalized.to_path_buf()))
         .map_err(|e| format!("verilog parse error: {e}"))?;
 
     let module = SVModule::from_ast(&ast)?;
-    let mod_name = module.get_name().to_string();
-
-    // Handles both single- and multi-output modules (e.g. c17.v), unlike
-    // to_expr::<LutLang>() which requires exactly one output.
+    let name = module.get_name().to_string();
     let expr = module.to_single_lut_expr()?;
 
-    let mut req: SynthRequest<LutLang, LutAnalysis> = SynthRequest::default()
+    let mut request: SynthRequest<LutLang, LutAnalysis> = SynthRequest::default()
         .with_expr(expr)
         .with_k(k)
         .with_rules(lutpacking_rules())
         .without_progress_bar();
-
-    let result = req
+    let result = request
         .synth::<SynthReport>()
         .map_err(|e| format!("eqmap synthesis failed: {e}"))?;
 
-    let out_module = SVModule::from_luts(result.get_expr().clone(), mod_name, vec![])?;
-
-    fs::write(output, out_module.to_string()).map_err(|e| format!("failed to write output: {e}"))
+    let packed = SVModule::from_luts(result.get_expr().clone(), name, vec![])?;
+    fs::write(output, packed.to_string()).map_err(|e| format!("failed to write output: {e}"))
 }
 
+/// Normalize `input` through a temporary file, then pack it into `output`.
+///
+/// The temporary file is removed on success and failure.
 fn process_one(input: &Path, output: &Path, techmap: &Path, k: usize) -> Result<(), String> {
-    // Normalize into a temp file next to the final output, then run eqmap
-    // over it and overwrite output with eqmap's result.  The temp file is
-    // removed on both success and failure.
     let normalized = output.with_extension("normalized.v");
-    let result = run_yosys(input, &normalized, techmap).and_then(|()| run_eqmap(&normalized, output, k));
+    let result = yosys::normalize(input, &normalized, techmap)
+        .and_then(|()| pack_luts(&normalized, output, k));
     let _ = fs::remove_file(&normalized);
     result
 }
 
+/// Process every raw file; returns the number that failed.
 fn run(cli: Cli) -> Result<usize, String> {
-    let techmap = cli.techmap.clone().unwrap_or_else(|| cli.out_dir.join("techmap.v"));
+    let techmap = cli
+        .techmap
+        .clone()
+        .unwrap_or_else(|| cli.out_dir.join("techmap.v"));
 
     if !cli.raw_dir.exists() {
         return Err(format!(
@@ -121,17 +100,14 @@ fn run(cli: Cli) -> Result<usize, String> {
     println!("  techmap: {}\n", techmap.display());
 
     let inputs = collect_inputs(std::slice::from_ref(&cli.raw_dir), None)?;
-    let mut failures = 0usize;
-
+    let mut failures = 0;
     for input in &inputs {
-        let file = input.file_name().unwrap();
-        let name = file.to_string_lossy();
+        let file = input.file_name().expect("collected inputs are files");
         let output = cli.out_dir.join(file);
-
         match process_one(input, &output, &techmap, cli.k) {
-            Ok(()) => println!("  {name}: OK -> {}", output.display()),
+            Ok(()) => println!("  {}: OK -> {}", file.to_string_lossy(), output.display()),
             Err(e) => {
-                eprintln!("  {name}: FAILED\n    {e}");
+                eprintln!("  {}: FAILED\n    {e}", file.to_string_lossy());
                 failures += 1;
             }
         }
@@ -142,7 +118,7 @@ fn run(cli: Cli) -> Result<usize, String> {
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(0) => {
-            println!("\nDone. Run:  cargo run --bin compare --release");
+            println!("\nDone. Run:  cargo run --release --bin compare");
             ExitCode::SUCCESS
         }
         Ok(n) => {

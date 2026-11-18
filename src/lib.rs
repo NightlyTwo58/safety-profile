@@ -1,68 +1,67 @@
-/// Core pipeline library for safety-profiler.
-///
-/// This is the single source of truth for pipeline execution.  Every consumer
-/// (the `safety-profiler` CLI, the `compare` harness, and the Criterion
-/// benches) calls into here rather than duplicating stage logic.
-///
-/// # Stage sequence
-///
-/// ```text
-/// Verilog source str
-///     |
-///     v parse      sv_parser::parse_sv_str
-///     v compile    nl_compiler::from_vast  (first/top module)
-///     v clean1     safety_pass::Clean
-///     v fold       safety_pass::FoldAllPatterns
-///     v clean2     safety_pass::Clean
-///     v emit       safety_pass::PrintVerilog
-///     v
-/// String (Verilog output)
-/// ```
+//! Pipeline library for safety-profiler.
+//!
+//! Single source of truth for pipeline execution, shared by the
+//! `safety-profiler` CLI, the `compare` harness, and the Criterion benches.
+//!
+//! ```text
+//! Verilog source
+//!   -> parse    sv_parser::parse_sv_str
+//!   -> compile  nl_compiler::from_vast (first module)
+//!   -> clean1   safety_pass::Clean
+//!   -> fold     safety_pass::FoldAllPatterns
+//!   -> clean2   safety_pass::Clean
+//!   -> emit     safety_pass::PrintVerilog
+//! Verilog output
+//! ```
+//!
+//! `RenameNets` is measured separately by [`run_rename_nets`].
+
 pub mod flame;
 pub mod io;
+pub mod report;
 pub mod stats;
+pub mod yosys;
 
 use nl_compiler::from_vast;
 use safety_pass::passes::{Clean, FoldAllPatterns, PrintVerilog, RenameNets};
 use safety_pass::{Cell, Pass};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use sv_parser::parse_sv_str;
+use sv_parser::{parse_sv_str, SyntaxTree};
 
-type Net = Rc<safety_net::Netlist<Cell>>;
+/// Shared handle to a compiled netlist.
+pub type Net = Rc<safety_net::Netlist<Cell>>;
 
-/// Stage labels in execution order.  Shared by every consumer so column sets
-/// cannot drift from what `run_pipeline` actually records.
+/// Boxed error returned by every pipeline stage.
+pub type PipelineError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Stage names in execution order, matching [`run_pipeline`].
 pub const STAGE_NAMES: [&str; 6] = ["parse", "compile", "clean1", "fold", "clean2", "emit"];
 
-// Public types
-
-/// Timing and optional diagnostic message for one pipeline stage.
+/// Timing and optional note for one stage.
 #[derive(Debug, Clone)]
 pub struct StageTiming {
-    /// Short label, e.g. `"parse"`, `"clean1"`.  Never changes between runs.
     pub name: &'static str,
     pub elapsed: Duration,
-    /// Human-readable note emitted by the pass, e.g. `"removed 4 dead cells"`.
+    /// Message returned by the pass, if it produces one.
     pub note: Option<String>,
 }
 
 impl StageTiming {
-    #[inline]
     pub fn micros(&self) -> u128 {
         self.elapsed.as_micros()
     }
 }
 
-/// The complete result of one pipeline execution.
+/// Result of one full pipeline run.
 #[derive(Debug)]
 pub struct PipelineResult {
     /// One entry per stage, in execution order.
     pub stages: Vec<StageTiming>,
-    /// Emitted Verilog from the final `PrintVerilog` pass.
+    /// Verilog emitted by the final stage.
     pub verilog: String,
 }
 
@@ -72,8 +71,11 @@ impl PipelineResult {
         self.stages.iter().map(StageTiming::micros).sum()
     }
 
-    /// Look up a stage by name.  Panics if the name is not found: stages are
-    /// static, so a missing name is a programming error, not a runtime one.
+    /// Look up a stage by name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not in [`STAGE_NAMES`].
     pub fn stage(&self, name: &str) -> &StageTiming {
         self.stages
             .iter()
@@ -82,32 +84,26 @@ impl PipelineResult {
     }
 }
 
-// Error type
-
-/// Thin wrapper so callers do not need to import `Box<dyn Error>` everywhere.
-pub type PipelineError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-// Per-stage functions (used directly by the benches for isolation).
-//
-// `#[inline(never)]` keeps each stage as its own frame in flamegraphs.
-
-/// Stage 1: Parse Verilog source into an AST.
+/// Parse Verilog source into a syntax tree.
+///
+/// `path` is used for diagnostics only. Stages are `#[inline(never)]` so each
+/// appears as its own flamegraph frame.
 #[inline(never)]
-pub fn stage_parse(src: &str, path: &Path) -> Result<sv_parser::SyntaxTree, PipelineError> {
+pub fn stage_parse(src: &str, path: &Path) -> Result<SyntaxTree, PipelineError> {
     let (ast, _) = parse_sv_str(
         src,
         path.to_path_buf(),
         &HashMap::new(),
-        &[] as &[std::path::PathBuf],
+        &[] as &[PathBuf],
         true,
         false,
     )?;
     Ok(ast)
 }
 
-/// Stage 2: Compile AST -> Netlist (first/top module).
+/// Compile a syntax tree into a netlist of its first module.
 #[inline(never)]
-pub fn stage_compile(ast: &sv_parser::SyntaxTree) -> Result<Net, PipelineError> {
+pub fn stage_compile(ast: &SyntaxTree) -> Result<Net, PipelineError> {
     let netlist = from_vast::<Cell>(ast)?
         .into_iter()
         .next()
@@ -115,74 +111,63 @@ pub fn stage_compile(ast: &sv_parser::SyntaxTree) -> Result<Net, PipelineError> 
     Ok(netlist)
 }
 
-/// Stage 3 / 5: Clean pass (dead-cell and dead-wire removal).
+/// Remove dead cells and wires.
 #[inline(never)]
 pub fn stage_clean(netlist: &Net) -> Result<String, PipelineError> {
     Ok(Clean(PhantomData::<Cell>).run(netlist)?)
 }
 
-/// Stage 4: Fold constant and pattern-matchable expressions.
+/// Fold constant and pattern-matchable expressions.
 #[inline(never)]
 pub fn stage_fold(netlist: &Net) -> Result<String, PipelineError> {
     Ok(FoldAllPatterns.run(netlist)?)
 }
 
-/// Stage 6: Emit Verilog from the optimised netlist.
+/// Emit Verilog from the netlist.
 #[inline(never)]
 pub fn stage_emit(netlist: &Net) -> Result<String, PipelineError> {
     Ok(PrintVerilog(PhantomData::<Cell>).run(netlist)?)
 }
 
-/// Apply the sequential net and instance renaming pass.
+/// Rename nets and instances sequentially.
 #[inline(never)]
 pub fn stage_rename_nets(netlist: &Net) -> Result<String, PipelineError> {
     Ok(RenameNets(PhantomData::<Cell>).run(netlist)?)
 }
 
-/// Run `RenameNets` on a freshly compiled netlist and return only its timing.
-/// Parsing and compilation are setup, so they are excluded from the measurement.
-pub fn run_rename_nets(src: &str, path: &Path) -> Result<StageTiming, PipelineError> {
-    let ast = stage_parse(src, path)?;
-    let netlist = stage_compile(&ast)?;
-    timed_note("rename_nets", || stage_rename_nets(&netlist))
-}
-
-// Full pipeline
-
-/// Time `f`, record it under `name`, and return its value.
+/// Time `f` and record it under `name`.
 fn timed<T>(
     stages: &mut Vec<StageTiming>,
     name: &'static str,
     f: impl FnOnce() -> Result<T, PipelineError>,
 ) -> Result<T, PipelineError> {
-    let t = Instant::now();
-    let out = f()?;
+    let start = Instant::now();
+    let value = f()?;
     stages.push(StageTiming {
         name,
-        elapsed: t.elapsed(),
+        elapsed: start.elapsed(),
         note: None,
     });
-    Ok(out)
+    Ok(value)
 }
 
-/// Like `timed`, for passes whose returned `String` is a diagnostic note.
+/// Time a pass whose returned `String` is a note.
 fn timed_note(
     name: &'static str,
     f: impl FnOnce() -> Result<String, PipelineError>,
 ) -> Result<StageTiming, PipelineError> {
-    let t = Instant::now();
+    let start = Instant::now();
     let note = f()?;
     Ok(StageTiming {
         name,
-        elapsed: t.elapsed(),
+        elapsed: start.elapsed(),
         note: Some(note),
     })
 }
 
-/// Run the complete pipeline and return structured timing + output.
+/// Run the full pipeline on already-loaded source.
 ///
-/// File I/O is the caller's responsibility: pass the already-loaded source
-/// string and the path (used by the parser for diagnostics only).
+/// File I/O is the caller's job so it never enters the timings.
 pub fn run_pipeline(src: &str, path: &Path) -> Result<PipelineResult, PipelineError> {
     let mut stages = Vec::with_capacity(STAGE_NAMES.len());
 
@@ -194,4 +179,13 @@ pub fn run_pipeline(src: &str, path: &Path) -> Result<PipelineResult, PipelineEr
     let verilog = timed(&mut stages, "emit", || stage_emit(&netlist))?;
 
     Ok(PipelineResult { stages, verilog })
+}
+
+/// Time `RenameNets` on a freshly compiled netlist.
+///
+/// Parsing and compilation are untimed setup.
+pub fn run_rename_nets(src: &str, path: &Path) -> Result<StageTiming, PipelineError> {
+    let ast = stage_parse(src, path)?;
+    let netlist = stage_compile(&ast)?;
+    timed_note("rename_nets", || stage_rename_nets(&netlist))
 }

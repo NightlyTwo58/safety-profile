@@ -202,7 +202,7 @@ fn run(cli: Cli) -> Result<usize, String> {
     let mut failures = 0;
     for input in &inputs {
         let name = stem(input);
-        let measured = fs::read_to_string(input)
+        let measured = safety_profiler::io::read_source(input)
             .map_err(|e| format!("read error: {e}"))
             .and_then(|src| bench(&cli, &out, input, &src, &name).map(|row| (src, row)));
         let (src, row) = match measured {

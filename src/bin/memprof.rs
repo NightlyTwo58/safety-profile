@@ -103,7 +103,7 @@ fn run(cli: Cli) -> Result<usize, String> {
 
     for input in &inputs {
         let name = stem(input);
-        let result = fs::read_to_string(input)
+        let result = safety_profiler::io::read_source(input)
             .map_err(|e| format!("read error: {e}"))
             .and_then(|src| {
                 run_pipeline(&src, input).map_err(|e| format!("pipeline error: {e}"))?;

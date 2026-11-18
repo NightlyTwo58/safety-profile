@@ -30,7 +30,7 @@ fn load_inputs() -> Vec<Circuit> {
         .unwrap_or_else(|e| panic!("{e}"))
         .into_iter()
         .map(|path| {
-            let src = fs::read_to_string(&path)
+            let src = safety_profiler::io::read_source(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
             (stem(&path), src, path)
         })

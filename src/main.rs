@@ -52,8 +52,7 @@ fn print_summary(name: &str, samples: &[u128], note: &str) {
 
 fn run(cli: Cli) -> Result<(), String> {
     let out = OutDir::new(&cli.out_dir);
-    let src =
-        fs::read_to_string(&cli.input).map_err(|e| format!("{}: {e}", cli.input.display()))?;
+    let src = safety_profiler::io::read_source(&cli.input).map_err(|e| format!("{}: {e}", cli.input.display()))?;
     let name = stem(&cli.input);
     let iters = cli.iters.max(1);
 

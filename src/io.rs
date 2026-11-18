@@ -13,6 +13,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    borrow::Cow,
 };
 
 /// File stem of `path` as an owned string.
@@ -21,6 +22,36 @@ pub fn stem(path: &Path) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+/// fix to rewrite Xilinx-style `INV` ports (`I`/`O`) to the (`A`/`ZN`)
+/// files without a `.I(` pin are not touched
+pub fn read_source(path: &Path) -> Result<String, String> {
+    let src = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(fix_inv_ports(&src).into_owned())
+}
+
+fn fix_inv_ports(src: &str) -> Cow<'_, str> {
+    if !src.contains(".I(") {
+        return Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut in_inv = false;
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with("INV ") {
+            in_inv = true;
+        }
+        if in_inv {
+            out.push_str(&line.replace(".I(", ".A(").replace(".O(", ".ZN("));
+            if t.contains(");") {
+                in_inv = false;
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// True for valid pipeline inputs: `*.v`, excluding generated files and `techmap.v`.

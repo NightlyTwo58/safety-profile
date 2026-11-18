@@ -35,7 +35,7 @@ struct Cli {
 }
 
 fn rename_one(input: &Path, dir: &Path) -> Result<PathBuf, String> {
-    let src = fs::read_to_string(input).map_err(|e| format!("read error: {e}"))?;
+    let src = safety_profiler::io::read_source(input).map_err(|e| format!("read error: {e}"))?;
     let verilog = rename_netlist(&src, input).map_err(|e| format!("rename failed: {e}"))?;
     let path = dir.join(format!("{}.v", stem(input)));
     fs::write(&path, verilog).map_err(|e| format!("{}: {e}", path.display()))?;
